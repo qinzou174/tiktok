@@ -10,7 +10,7 @@ try {
   New-Item -ItemType Directory -Path $staging | Out-Null
   $items = @(
     "public", "deploy", "docs", "scripts", "tests",
-    "server.mjs", "archive.mjs", "api-scheduler.mjs", "package.json", "Dockerfile", "compose.yaml",
+    "server.mjs", "archive.mjs", "api-scheduler.mjs", "api-circuit-breaker.mjs", "douyin-url.mjs", "package.json", "Dockerfile", "compose.yaml",
     ".dockerignore", ".gitignore", ".env.example", "README.md"
   )
   foreach ($item in $items) {

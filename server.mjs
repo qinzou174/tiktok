@@ -8,6 +8,8 @@ import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { archivePathExists, archiveRelativePath, archiveWorkKey, safeArchiveName, writeArchive } from "./archive.mjs";
 import { ApiRequestScheduler } from "./api-scheduler.mjs";
+import { ApiCircuitBreaker } from "./api-circuit-breaker.mjs";
+import { canonicalDouyinUrl } from "./douyin-url.mjs";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(ROOT, "public");
@@ -26,6 +28,8 @@ const config = {
   maxRetries: clampNumber(process.env.MAX_RETRIES, 8, 1, 30),
   allowedOrigins: String(process.env.ALLOWED_ORIGINS || "").split(",").map((item) => item.trim()).filter(Boolean),
   archiveRoot: String(process.env.ARCHIVE_ROOT || "").trim(),
+  circuitFailures: clampNumber(process.env.API_CIRCUIT_FAILURES, 3, 1, 20),
+  circuitCooldownMs: clampNumber(process.env.API_CIRCUIT_COOLDOWN_SECONDS, 180, 10, 3600) * 1000,
 };
 
 if (!config.apiKey) {
@@ -85,6 +89,14 @@ const parserScheduler = new ApiRequestScheduler({
   execute: callParserRequest,
   minIntervalMs: 1_000,
   onStateChange: () => broadcast("runtime", runtimeState()),
+});
+const apiCircuit = new ApiCircuitBreaker({
+  failureThreshold: config.circuitFailures,
+  cooldownMs: config.circuitCooldownMs,
+  onStateChange: (state) => {
+    console.warn(`[api-circuit] status=${state.status} failures=${state.failures} open_until=${state.openUntil || "-"}`);
+    broadcast("runtime", runtimeState());
+  },
 });
 
 await restoreTasks();
@@ -260,16 +272,19 @@ async function processTaskAttempt(task, queueKind) {
     console.info(`[task:${task.id}] completed attempt=${attempt} type=${task.result?.type || "unknown"} author=${task.result?.author || "unknown"}`);
   } catch (error) {
     const retryable = isRetryable(error);
-    if (!retryable || attempt >= config.maxRetries) {
+    const circuitPaused = error?.code === "API_CIRCUIT_OPEN";
+    if (circuitPaused) task.attempt = Math.max(0, attempt - 1);
+    if (!retryable || (!circuitPaused && attempt >= config.maxRetries)) {
       await updateTask(task, { status: "failed", progress: failureStage === "media" ? "保存失败" : "解析失败", error: cleanError(error), nextRetryAt: null, retryStage: failureStage });
       console.error(`[task:${task.id}] failed attempt=${attempt} error=${cleanError(error)}`);
       return;
     }
-    const delayMs = Math.min(60_000, 2_000 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 800);
+    const backoffMs = Math.min(60_000, 2_000 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 800);
+    const delayMs = circuitPaused ? Math.max(backoffMs, Number(error.retryAfterMs || 0)) : backoffMs;
     const nextRetryAt = new Date(Date.now() + delayMs).toISOString();
     await updateTask(task, {
       status: "retrying",
-      progress: `${failureStage === "media" ? "保存暂时失败" : "解析暂时失败"}，${Math.ceil(delayMs / 1000)} 秒后进入重试队列`,
+      progress: `${circuitPaused ? "远梦服务熔断暂停" : failureStage === "media" ? "保存暂时失败" : "解析暂时失败"}，${Math.ceil(delayMs / 1000)} 秒后进入重试队列`,
       error: cleanError(error),
       nextRetryAt,
       retryStage: failureStage,
@@ -309,6 +324,7 @@ function runtimeState(extra = {}) {
     apiCallActive: parserScheduler.active,
     apiFreshWaiting: parserScheduler.fresh.length,
     apiRetryWaiting: parserScheduler.retry.length,
+    apiCircuit: apiCircuit.state(),
   };
 }
 
@@ -394,10 +410,7 @@ async function normalizeDouyinUrl(source) {
     });
     const finalUrl = response.url || current;
     await response.body?.cancel();
-    const final = new URL(finalUrl);
-    const match = final.pathname.match(/\/(?:note|video)\/(\d+)/);
-    if (match) return `https://www.douyin.com/${final.pathname.includes("/note/") ? "note" : "video"}/${match[1]}`;
-    return finalUrl;
+    return canonicalDouyinUrl(finalUrl);
   } catch (error) {
     if (/v\.douyin\.com|iesdouyin\.com/i.test(current)) throw retryableError(`分享链接跳转失败：${error.message}`);
     return current;
@@ -405,6 +418,7 @@ async function normalizeDouyinUrl(source) {
 }
 
 async function callParserRequest(url) {
+  apiCircuit.beforeRequest();
   const apiUrl = new URL(API_ENDPOINT);
   apiUrl.searchParams.set("url", url);
   let response;
@@ -414,18 +428,33 @@ async function callParserRequest(url) {
       headers: { accept: "application/json", authorization: `Bearer ${config.apiKey}` },
     });
   } catch (error) {
+    apiCircuit.infrastructureFailure();
     throw retryableError(`解析接口连接失败：${error.message}`);
   }
   const text = await response.text();
   let data;
-  try { data = JSON.parse(text); } catch { throw retryableError(`解析接口返回了无效内容（HTTP ${response.status}）`); }
-  if (!response.ok) throw retryableError(data.message || `解析接口 HTTP ${response.status}`);
+  try { data = JSON.parse(text); } catch {
+    apiCircuit.infrastructureFailure();
+    throw retryableError(`解析接口返回了无效内容（HTTP ${response.status}）`);
+  }
+  if (!response.ok) {
+    if (response.status >= 500) apiCircuit.infrastructureFailure();
+    else apiCircuit.success();
+    throw retryableError(data.message || `解析接口 HTTP ${response.status}`);
+  }
   if (data.success !== true) {
     const message = String(data.message || "解析失败");
+    if (isParserInfrastructureFailure(message)) apiCircuit.infrastructureFailure();
+    else apiCircuit.success();
     if (/无法识别|不支持|无效链接|不存在/.test(message)) throw permanentError(message);
     throw retryableError(message);
   }
+  apiCircuit.success();
   return data;
+}
+
+function isParserInfrastructureFailure(message) {
+  return /failed to connect|failed to connecting|connection.*(?:timed out|refused|reset)|timeout|timed out|upstream|bad gateway|service unavailable/i.test(String(message));
 }
 
 function normalizeResult(data) {

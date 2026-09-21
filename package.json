@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "check": "node --check server.mjs && node --check archive.mjs && node --check api-scheduler.mjs && node --check public/app.js && node --check public/detail.js && node --check tests/self-check.mjs && node --check tests/archive-test.mjs && node --check tests/scheduler-test.mjs",
-    "test": "node tests/self-check.mjs && node tests/archive-test.mjs && node tests/scheduler-test.mjs"
+    "check": "node --check server.mjs && node --check archive.mjs && node --check api-scheduler.mjs && node --check api-circuit-breaker.mjs && node --check douyin-url.mjs && node --check public/app.js && node --check public/detail.js && node --check tests/self-check.mjs && node --check tests/archive-test.mjs && node --check tests/scheduler-test.mjs && node --check tests/circuit-url-test.mjs",
+    "test": "node tests/self-check.mjs && node tests/archive-test.mjs && node tests/scheduler-test.mjs && node tests/circuit-url-test.mjs"
   },
   "engines": {
     "node": ">=22.5"

@@ -20,6 +20,7 @@ npm start
 - 媒体下载和归档保持有界并发，每任务最多同时下载 3 个媒体文件。
 - 短链接和 `iesdouyin.com/share/note` 自动转换为标准作品地址。
 - 网络超时与远梦上游故障采用指数退避自动重试，默认最多 8 次。
+- 连续基础设施故障会触发全局熔断，暂停真实请求并在冷却后只放行一条恢复探测；熔断等待不消耗任务重试次数。
 - 图片、视频、实况片段与音乐真实保存到 `data/tasks/`，支持播放进度 Range 请求。
 - 每个任务从创建时起独立保留 24 小时，服务重启后仍能恢复任务。
 - SQLite 持久记录作者作品序号：`作者.jpg`、`作者.2.jpg`、`作者.3.jpg`。
@@ -35,6 +36,8 @@ npm start
 | `MAX_CONCURRENCY` | `4` | 媒体下载与归档任务并发，范围 1–20 |
 | `TASK_TTL_HOURS` | `24` | 每个任务的独立保留时间 |
 | `MAX_RETRIES` | `8` | 可重试故障的最大尝试次数 |
+| `API_CIRCUIT_FAILURES` | `3` | 连续多少次基础设施故障后熔断 |
+| `API_CIRCUIT_COOLDOWN_SECONDS` | `180` | 熔断后的恢复探测等待秒数 |
 | `ALLOWED_ORIGINS` | 空 | 前后端分离时允许的前端域名，逗号分隔 |
 | `ARCHIVE_ROOT` | `/app/archive` | 容器内永久归档目录 |
 | `NAS_ARCHIVE_PATH` | `./archive` | Compose 挂载的宿主机归档目录 |
