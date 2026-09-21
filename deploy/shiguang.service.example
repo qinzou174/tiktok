@@ -1,0 +1,19 @@
+[Unit]
+Description=Shiguang Douyin Media Parser
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=douyin
+Group=douyin
+WorkingDirectory=/opt/douyin-parser-web
+EnvironmentFile=/opt/douyin-parser-web/.env
+ExecStart=/usr/bin/node /opt/douyin-parser-web/server.mjs
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

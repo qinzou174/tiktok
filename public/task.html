@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#080a0f">
+  <title>任务详情 · 拾光</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='18' fill='%23100b10'/%3E%3Cpath d='M18 20h28v7H18zm7 17h21v7H25z' fill='%23ffd39a'/%3E%3Ccircle cx='18' cy='40.5' r='4' fill='%23e8a7c5'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body class="detail-page">
+  <div class="ambient" aria-hidden="true"><span></span><span></span><span></span></div>
+  <div class="shell detail-shell">
+    <header class="topbar">
+      <a class="brand" href="./">
+        <span class="brand-mark"><i></i><i></i></span>
+        <span class="brand-copy"><strong>拾光</strong><small>LOCAL MEDIA ENGINE</small></span>
+      </a>
+      <a class="back-link" href="./"><span>←</span> 返回任务库</a>
+    </header>
+    <main id="detailRoot" class="detail-root" aria-live="polite">
+      <div class="detail-loading"><span class="spinner"></span><p>正在读取任务</p></div>
+    </main>
+  </div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="config.js"></script>
+  <script type="module" src="detail.js"></script>
+</body>
+</html>

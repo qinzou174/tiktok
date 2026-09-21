@@ -1,0 +1,19 @@
+services:
+  shiguang:
+    build: .
+    container_name: shiguang-douyin
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    environment:
+      HOST: 127.0.0.1
+      ARCHIVE_ROOT: /app/archive
+    network_mode: host
+    volumes:
+      - ./data:/app/data
+      - ${NAS_ARCHIVE_PATH:-./archive}:/app/archive
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

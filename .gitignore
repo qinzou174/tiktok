@@ -1,0 +1,7 @@
+.env
+data/
+node_modules/
+.sites-runtime/
+archive/
+*.zip
+*.log
