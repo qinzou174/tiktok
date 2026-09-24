@@ -76,7 +76,8 @@ async function submitText(text) {
     const response = await fetch(apiUrl("/api/tasks"), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: clean }) });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "创建任务失败");
-    tasks = [...data.tasks, ...tasks];
+    // 响应内为创建顺序（旧→新），反转后与全局“最新在前”排序一致，避免 SSE 快照到达时卡片跳动。
+    tasks = [...data.tasks.slice().reverse(), ...tasks];
     render();
     showToast(`已创建 ${data.tasks.length} 个任务`);
   } catch (error) {
@@ -185,19 +186,25 @@ function render() {
     card.remove();
   }
 
+  // 只触碰内容有变化或位置不对的卡片：对已有卡片调用 appendChild/insertBefore 会
+  // 重新插入 DOM 节点并重放入场动画，导致整个列表反复“闪现”。移动前先加 no-enter
+  // 禁用动画，保证已有卡片视觉上纹丝不动。
   tasks.forEach((task, index) => {
     const signature = taskSignature(task);
-    const existing = grid.querySelector(`[data-task-id="${CSS.escape(task.id)}"]`);
-    let card = existing;
-    if (!existing) {
+    let card = grid.querySelector(`[data-task-id="${CSS.escape(task.id)}"]`);
+    if (!card) {
       card = cardElement(task, index, false);
       renderedSignatures.set(task.id, signature);
     } else if (renderedSignatures.get(task.id) !== signature) {
-      card = cardElement(task, index, true);
-      existing.replaceWith(card);
+      const updated = cardElement(task, index, true);
+      card.replaceWith(updated);
+      card = updated;
       renderedSignatures.set(task.id, signature);
     }
-    grid.appendChild(card);
+    if (card !== grid.children[index]) {
+      card.classList.add("no-enter");
+      grid.insertBefore(card, grid.children[index] || null);
+    }
   });
 
   for (const node of grid.querySelectorAll("[data-expires-at]")) {

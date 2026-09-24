@@ -22,8 +22,8 @@ await check("health endpoint", async () => {
   const data = await response.json();
   assert.equal(response.status, 200);
   assert.equal(data.ok, true);
-  assert.ok(data.concurrency >= 1 && data.concurrency <= 20);
-  assert.ok(Number.isInteger(data.delayedRetries));
+  assert.equal(data.concurrency, 1); // 串行调度：一次一个任务
+  assert.ok(data.activeWorkers === 0 || data.activeWorkers === 1);
 });
 
 await check("frontend entrypoints and generated asset", async () => {

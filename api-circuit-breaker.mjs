@@ -30,7 +30,8 @@ export class ApiCircuitBreaker {
   }
 
   infrastructureFailure() {
-    this.failures += 1;
+    // 失败计数封顶：半开探测反复失败时不无限增长，状态广播保持可读。
+    this.failures = Math.min(this.failures + 1, this.failureThreshold);
     if (this.halfOpen || this.failures >= this.failureThreshold) {
       this.openUntil = this.now() + this.cooldownMs;
       this.halfOpen = false;

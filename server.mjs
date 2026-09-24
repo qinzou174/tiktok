@@ -10,6 +10,7 @@ import { archivePathExists, archiveRelativePath, archiveWorkKey, safeArchiveName
 import { ApiRequestScheduler } from "./api-scheduler.mjs";
 import { ApiCircuitBreaker } from "./api-circuit-breaker.mjs";
 import { canonicalDouyinUrl } from "./douyin-url.mjs";
+import { isParserInfrastructureFailure } from "./parser-errors.mjs";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(ROOT, "public");
@@ -23,13 +24,13 @@ const config = {
   apiKey: process.env.QZQI_API_KEY || "",
   host: process.env.HOST || "0.0.0.0",
   port: clampNumber(process.env.PORT, 4173, 1, 65535),
-  concurrency: clampNumber(process.env.MAX_CONCURRENCY, 4, 1, 20),
   ttlMs: clampNumber(process.env.TASK_TTL_HOURS, 24, 1, 168) * 60 * 60 * 1000,
   maxRetries: clampNumber(process.env.MAX_RETRIES, 8, 1, 30),
   allowedOrigins: String(process.env.ALLOWED_ORIGINS || "").split(",").map((item) => item.trim()).filter(Boolean),
   archiveRoot: String(process.env.ARCHIVE_ROOT || "").trim(),
   circuitFailures: clampNumber(process.env.API_CIRCUIT_FAILURES, 3, 1, 20),
   circuitCooldownMs: clampNumber(process.env.API_CIRCUIT_COOLDOWN_SECONDS, 180, 10, 3600) * 1000,
+  apicxToken: String(process.env.APICX_TOKEN || "").trim(),
 };
 
 if (!config.apiKey) {
@@ -80,14 +81,16 @@ const tasks = new Map();
 const queue = [];
 const retryQueue = [];
 const queuedIds = new Set();
-const retryTimers = new Map();
 const sseClients = new Set();
 const archiveInflight = new Map();
-let activeWorkers = 0;
+const activeTaskIds = new Set();
+const TASK_GAP_MS = 3_000; // 任务结束到下一个任务开始的固定间隔
+let activeWorkers = 0;      // 串行模型：恒为 0 或 1
+let taskGapTimer = null;
 let lastAccessAt = 0;
 const parserScheduler = new ApiRequestScheduler({
   execute: callParserRequest,
-  minIntervalMs: 1_000,
+  minIntervalMs: 3_000,
   onStateChange: () => broadcast("runtime", runtimeState()),
 });
 const apiCircuit = new ApiCircuitBreaker({
@@ -115,7 +118,7 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(config.port, config.host, () => {
   console.log(`抖音解析台已启动：http://${config.host}:${config.port}`);
-  console.log(`并发任务数：${config.concurrency}，任务保留：${config.ttlMs / 3600000} 小时`);
+  console.log(`任务串行调度：一次一个，任务间隔 ${TASK_GAP_MS / 1000} 秒；任务保留：${config.ttlMs / 3600000} 小时`);
 });
 
 setInterval(() => { if (tasks.size) cleanupExpired(); }, 60_000).unref();
@@ -132,7 +135,7 @@ async function route(req, res) {
   }
 
   if (req.method === "GET" && url.pathname === "/api/health") {
-    return sendJson(res, 200, runtimeState({ ok: true, concurrency: config.concurrency }));
+    return sendJson(res, 200, runtimeState({ ok: true, concurrency: 1 }));
   }
 
   if (req.method === "GET" && url.pathname === "/api/events") {
@@ -167,7 +170,13 @@ async function route(req, res) {
     task.error = null;
     task.attempt = 0;
     task.progress = "等待重新解析";
+    // 手动重试必须从解析阶段重新开始：旧媒体 URL 会过期，复用只会反复失败。
+    task.retryStage = null;
+    task.result = null;
+    task._rawApi = null;
+    task.files = [];
     task.updatedAt = new Date().toISOString();
+    await rm(taskDir(task.id), { recursive: true, force: true }).catch(() => {});
     await persistTask(task);
     enqueueTask(task, "retry");
     pumpQueue();
@@ -216,35 +225,45 @@ async function createTask(sourceUrl) {
 }
 
 function enqueueTask(task, kind = "fresh") {
-  if (!task || task.status !== "queued" || queuedIds.has(task.id)) return false;
+  if (!task || !["queued", "retrying"].includes(task.status) || queuedIds.has(task.id)) return false;
   (kind === "retry" ? retryQueue : queue).push(task.id);
   queuedIds.add(task.id);
+  // 空闲立即：没有任务在跑时，新入队的任务马上开始，不等待任务间隔。
+  if (!activeWorkers) {
+    if (taskGapTimer) { clearTimeout(taskGapTimer); taskGapTimer = null; }
+    pumpQueue();
+  }
   broadcast("runtime", runtimeState());
   return true;
 }
 
 function pumpQueue() {
-  while (activeWorkers < config.concurrency) {
-    let kind = "fresh";
-    let id = queue.shift();
-    if (!id) {
-      // Failed work is deliberately paused until every first-pass task and
-      // its download/archive stage has finished. Retries then run one by one.
-      if (activeWorkers > 0 || !retryQueue.length) break;
-      kind = "retry";
-      id = retryQueue.shift();
-    }
-    queuedIds.delete(id);
-    const task = tasks.get(id);
-    if (!task || task.status !== "queued") continue;
-    activeWorkers += 1;
-    broadcast("runtime", runtimeState());
-    processTaskAttempt(task, kind).catch(console.error).finally(() => {
-      activeWorkers -= 1;
-      broadcast("runtime", runtimeState());
-      pumpQueue();
-    });
+  if (activeWorkers > 0) return; // 串行模型：同一时刻最多一个任务
+  let kind = "fresh";
+  let id = queue.shift();
+  if (!id) {
+    // 主队列（首次任务）全部跑完后，才逐个从重试列表拉回失败任务。
+    id = retryQueue.shift();
+    if (!id) return;
+    kind = "retry";
   }
+  queuedIds.delete(id);
+  const task = tasks.get(id);
+  if (!task || !["queued", "retrying"].includes(task.status)) { pumpQueue(); return; }
+  activeWorkers = 1;
+  activeTaskIds.add(id);
+  broadcast("runtime", runtimeState());
+  processTaskAttempt(task, kind).catch(console.error).finally(() => {
+    activeWorkers = 0;
+    activeTaskIds.delete(id);
+    broadcast("runtime", runtimeState());
+    if (queue.length || retryQueue.length) {
+      // 任务间固定 10 秒间隔；间隔期内有新任务入队会被 enqueueTask 立即唤醒。
+      clearTimeout(taskGapTimer);
+      taskGapTimer = setTimeout(() => { taskGapTimer = null; pumpQueue(); }, TASK_GAP_MS);
+      taskGapTimer.unref();
+    }
+  });
 }
 
 async function processTaskAttempt(task, queueKind) {
@@ -256,9 +275,9 @@ async function processTaskAttempt(task, queueKind) {
       await updateTask(task, { status: "resolving", progress: "正在识别分享链接", error: null, nextRetryAt: null });
       task.normalizedUrl = await normalizeDouyinUrl(task.sourceUrl);
       await updateTask(task, { status: "parsing", progress: `正在解析（第 ${attempt} 次）` });
-    const data = await parserScheduler.schedule(task.normalizedUrl, queueKind);
-      task._rawApi = data;
-      task.result = normalizeResult(data);
+      const { raw, result } = await resolveParse(task.normalizedUrl, queueKind);
+      task._rawApi = raw;
+      task.result = result;
       validateParsedResult(task.result);
       task.naming = reserveAuthorSequence(task.id, task.result.author, task.createdAt);
       failureStage = "media";
@@ -279,38 +298,37 @@ async function processTaskAttempt(task, queueKind) {
       console.error(`[task:${task.id}] failed attempt=${attempt} error=${cleanError(error)}`);
       return;
     }
-    const backoffMs = Math.min(60_000, 2_000 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 800);
-    const delayMs = circuitPaused ? Math.max(backoffMs, Number(error.retryAfterMs || 0)) : backoffMs;
-    const nextRetryAt = new Date(Date.now() + delayMs).toISOString();
+    // 可重试失败：任务留在重试列表尾部，由统一节拍调度（主队列跑完后逐个拉回）。
+    if (circuitPaused) {
+      // 熔断：任务放回队首，等冷却结束再探测恢复，不消耗重试次数。
+      const delayMs = Math.max(1_000, Number(error.retryAfterMs || 0));
+      retryQueue.unshift(task.id);
+      queuedIds.add(task.id);
+      await updateTask(task, {
+        status: "retrying",
+        progress: `远梦服务熔断暂停，约 ${Math.ceil(delayMs / 1000)} 秒后自动探测恢复`,
+        error: cleanError(error),
+        nextRetryAt: null,
+        retryStage: failureStage,
+      });
+      console.warn(`[task:${task.id}] circuit_paused attempt=${attempt} delay_ms=${delayMs}`);
+      clearTimeout(taskGapTimer);
+      taskGapTimer = setTimeout(() => { taskGapTimer = null; pumpQueue(); }, delayMs);
+      taskGapTimer.unref();
+      broadcast("runtime", runtimeState());
+      return;
+    }
     await updateTask(task, {
       status: "retrying",
-      progress: `${circuitPaused ? "远梦服务熔断暂停" : failureStage === "media" ? "保存暂时失败" : "解析暂时失败"}，${Math.ceil(delayMs / 1000)} 秒后进入重试队列`,
+      progress: `${failureStage === "media" ? "保存失败" : "解析失败"}，已进入重试列表，等待轮到重试`,
       error: cleanError(error),
-      nextRetryAt,
+      nextRetryAt: null,
       retryStage: failureStage,
     });
-    console.warn(`[task:${task.id}] retry_scheduled attempt=${attempt} delay_ms=${delayMs} error=${cleanError(error)}`);
-    scheduleRetry(task, delayMs);
+    console.warn(`[task:${task.id}] retry_queued attempt=${attempt}/${config.maxRetries} error=${cleanError(error)}`);
+    retryQueue.push(task.id);
+    queuedIds.add(task.id);
   }
-}
-
-function scheduleRetry(task, delayMs) {
-  const previous = retryTimers.get(task.id);
-  if (previous) clearTimeout(previous);
-  const timer = setTimeout(async () => {
-    try {
-      retryTimers.delete(task.id);
-      if (!tasks.has(task.id) || task.status !== "retrying") return;
-      await updateTask(task, { status: "queued", progress: `等待第 ${Number(task.attempt || 0) + 1} 次尝试` });
-      enqueueTask(task, "retry");
-      pumpQueue();
-    } catch (error) {
-      console.error(`[task:${task.id}] retry_enqueue_failed error=${cleanError(error)}`);
-    }
-  }, Math.max(0, delayMs));
-  timer.unref();
-  retryTimers.set(task.id, timer);
-  broadcast("runtime", runtimeState());
 }
 
 function runtimeState(extra = {}) {
@@ -320,7 +338,6 @@ function runtimeState(extra = {}) {
     queued: queue.length + retryQueue.length,
     freshQueued: queue.length,
     retryQueued: retryQueue.length,
-    delayedRetries: retryTimers.size,
     apiCallActive: parserScheduler.active,
     apiFreshWaiting: parserScheduler.fresh.length,
     apiRetryWaiting: parserScheduler.retry.length,
@@ -453,8 +470,66 @@ async function callParserRequest(url) {
   return data;
 }
 
-function isParserInfrastructureFailure(message) {
-  return /failed to connect|failed to connecting|connection.*(?:timed out|refused|reset)|timeout|timed out|upstream|bad gateway|service unavailable/i.test(String(message));
+// 远梦不可用（连接失败/超时/5xx/透传上游错误/熔断）时，判定为基础设施故障，允许残像兜底。
+function isYuanmengInfrastructureError(error) {
+  if (error?.code === "API_CIRCUIT_OPEN") return true;
+  const message = String(error?.message || "");
+  return /解析接口|远梦服务/i.test(message) || isParserInfrastructureFailure(message);
+}
+
+// 解析总入口：远梦优先（单通道+熔断），基础设施故障时自动切换残像 API 兜底。
+async function resolveParse(normalizedUrl, queueKind) {
+  try {
+    const raw = await parserScheduler.schedule(normalizedUrl, queueKind);
+    return { raw, result: normalizeResult(raw) };
+  } catch (error) {
+    if (error?.retryable === false || !isYuanmengInfrastructureError(error) || !config.apicxToken) throw error;
+    console.warn(`[parser] 远梦不可用，切换残像兜底：${cleanError(error)}`);
+    const raw = await callApicxRequest(normalizedUrl);
+    return { raw, result: normalizeApicxResult(raw) };
+  }
+}
+
+async function callApicxRequest(normalizedUrl) {
+  const apiUrl = new URL("https://apicx.asia/api/douyin_parser");
+  apiUrl.searchParams.set("url", normalizedUrl);
+  apiUrl.searchParams.set("token", config.apicxToken);
+  let response;
+  try {
+    response = await fetch(apiUrl, { signal: AbortSignal.timeout(35_000), headers: { accept: "application/json" } });
+  } catch (error) {
+    throw retryableError(`备用解析接口连接失败：${error.message}`);
+  }
+  const text = await response.text();
+  let data;
+  try { data = JSON.parse(text); } catch {
+    throw retryableError(`备用解析接口返回了无效内容（HTTP ${response.status}）`);
+  }
+  if (!response.ok || data.code !== 200) {
+    const message = String(data.msg || `备用解析接口 HTTP ${response.status}`);
+    if (/无法识别|不支持|无效|不存在|请输入/.test(message)) throw permanentError(`备用解析：${message}`);
+    throw retryableError(`备用解析失败：${message}`);
+  }
+  return data;
+}
+
+function normalizeApicxResult(payload) {
+  const d = payload?.data || {};
+  const images = Array.isArray(d.images) ? d.images.filter((item) => typeof item === "string" && item.startsWith("http")) : [];
+  const isVideo = !images.length && Boolean(d.url) && (d.type === "video" || d.type !== "images");
+  return {
+    type: d.type === "images" ? "image" : isVideo ? "video" : String(d.type || "unknown"),
+    videoId: String(d.aweme_id || ""),
+    title: d.title || "未命名作品",
+    author: d.author || "未知作者",
+    authorInfo: { nickname: d.author || "", uid: d.uid || "" },
+    coverUrl: d.cover || null,
+    audioUrl: d.music_url || null,
+    videoUrl: isVideo ? (d.url || null) : null,
+    videoUrlHd: null,
+    images,
+    cleanImages: [],
+  };
 }
 
 function normalizeResult(data) {
@@ -480,14 +555,14 @@ async function downloadAll(task, result) {
   const candidates = [];
   const imageUrls = result.cleanImages.length ? result.cleanImages : result.images;
   imageUrls.forEach((url, index) => candidates.push({ role: "image", url, index }));
-  if (result.type === "video" && (result.videoUrlHd || result.videoUrl)) {
-    candidates.push({ role: "video", url: result.videoUrlHd || result.videoUrl, index: 0 });
-  }
-  if (result.type === "live_photo" && (result.videoUrlHd || result.videoUrl)) {
-    candidates.push({ role: "live_video", url: result.videoUrlHd || result.videoUrl, index: 0 });
+  const videoUrl = result.videoUrlHd || result.videoUrl;
+  if (videoUrl) {
+    // 只要返回了视频地址就下载，避免未知作品类型以 0 个文件“完成”。
+    candidates.push({ role: result.type === "live_photo" ? "live_video" : "video", url: videoUrl, index: 0 });
   }
   if (result.audioUrl) candidates.push({ role: "audio", url: result.audioUrl, index: 0 });
   if (result.coverUrl && !imageUrls.length) candidates.push({ role: "cover", url: result.coverUrl, index: 0 });
+  if (!candidates.length) throw retryableError("解析结果没有可下载的媒体地址");
 
   const saved = [];
   let completed = 0;
@@ -624,11 +699,12 @@ async function restoreTasks() {
       const task = JSON.parse(await readFile(path.join(DATA_DIR, entry.name, "task.json"), "utf8"));
       if (Date.parse(task.expiresAt) <= Date.now()) continue;
       tasks.set(task.id, task);
-      if (task.status === "retrying" && Date.parse(task.nextRetryAt) > Date.now()) {
-        scheduleRetry(task, Date.parse(task.nextRetryAt) - Date.now());
-      } else if (["queued", "resolving", "parsing", "downloading", "archiving", "retrying"].includes(task.status)) {
+      if (["queued", "resolving", "parsing", "downloading", "archiving", "retrying"].includes(task.status)) {
+        // 重启恢复：主队列任务回主队列；已有尝试次数的任务直接回重试列表，由统一节拍调度。
+        if (task.status === "queued") task.progress = "服务重启，继续任务";
+        else task.progress = "服务重启，重新进入调度";
         task.status = "queued";
-        task.progress = "服务重启，继续任务";
+        task.nextRetryAt = null;
         enqueueTask(task, Number(task.attempt || 0) > 0 ? "retry" : "fresh");
       }
     } catch (error) {
@@ -675,10 +751,9 @@ async function cleanupExpired() {
   const now = Date.now();
   for (const [id, task] of tasks) {
     if (Date.parse(task.expiresAt) > now) continue;
+    // 正在执行的任务跳过本轮清理，避免删除后 worker 复活目录形成僵尸文件。
+    if (activeTaskIds.has(id)) continue;
     tasks.delete(id);
-    const retryTimer = retryTimers.get(id);
-    if (retryTimer) clearTimeout(retryTimer);
-    retryTimers.delete(id);
     const queuedIndex = queue.indexOf(id);
     if (queuedIndex >= 0) queue.splice(queuedIndex, 1);
     const retryQueuedIndex = retryQueue.indexOf(id);
@@ -738,7 +813,9 @@ function closeEventClient(client) {
 
 async function serveTaskFile(req, res, task, file, download) {
   const filePath = path.join(taskDir(task.id), file.filename);
-  const info = await stat(filePath);
+  let info;
+  try { info = await stat(filePath); }
+  catch { return sendJson(res, 404, { error: "文件不存在或已被清理" }); }
   const range = req.headers.range;
   const disposition = `${download ? "attachment" : "inline"}; filename*=UTF-8''${encodeURIComponent(file.filename)}`;
   if (range) {
