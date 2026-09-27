@@ -11,6 +11,7 @@ import { ApiRequestScheduler } from "./api-scheduler.mjs";
 import { ApiCircuitBreaker } from "./api-circuit-breaker.mjs";
 import { canonicalDouyinUrl } from "./douyin-url.mjs";
 import { isParserInfrastructureFailure } from "./parser-errors.mjs";
+import { isSuccessfulParserResponse, normalizeParserResult, parserFailureMessage } from "./parser-response.mjs";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(ROOT, "public");
@@ -459,8 +460,8 @@ async function callParserRequest(url) {
     else apiCircuit.success();
     throw retryableError(data.message || `解析接口 HTTP ${response.status}`);
   }
-  if (data.success !== true) {
-    const message = String(data.message || "解析失败");
+  if (!isSuccessfulParserResponse(data)) {
+    const message = parserFailureMessage(data, "解析接口返回了未知响应");
     if (isParserInfrastructureFailure(message)) apiCircuit.infrastructureFailure();
     else apiCircuit.success();
     if (/无法识别|不支持|无效链接|不存在/.test(message)) throw permanentError(message);
@@ -481,7 +482,9 @@ function isYuanmengInfrastructureError(error) {
 async function resolveParse(normalizedUrl, queueKind) {
   try {
     const raw = await parserScheduler.schedule(normalizedUrl, queueKind);
-    return { raw, result: normalizeResult(raw) };
+    const result = normalizeParserResult(raw);
+    validateParsedResult(result);
+    return { raw, result };
   } catch (error) {
     if (error?.retryable === false || !isYuanmengInfrastructureError(error) || !config.apicxToken) throw error;
     console.warn(`[parser] 远梦不可用，切换残像兜底：${cleanError(error)}`);
@@ -529,25 +532,14 @@ function normalizeApicxResult(payload) {
     videoUrlHd: null,
     images,
     cleanImages: [],
-  };
-}
-
-function normalizeResult(data) {
-  const images = toArray(data.images);
-  const cleanImages = toArray(data.images_no_watermark);
-  return {
-    type: data.type || "unknown", videoId: String(data.video_id || ""), title: data.title || "未命名作品",
-    author: data.author || data.author_info?.nickname || "未知作者", authorInfo: data.author_info || null,
-    coverUrl: data.cover_url || null, audioUrl: data.audio_url || null,
-    videoUrl: data.video_url || null, videoUrlHd: data.video_url_hd || null,
-    images, cleanImages,
+    livePhotoVideos: [],
   };
 }
 
 function validateParsedResult(result) {
   if (!result.videoId) throw retryableError("解析接口未返回作品 ID");
   if (!result.author || result.author === "未知作者") throw retryableError("解析接口未返回作者信息");
-  const hasMedia = Boolean(result.videoUrlHd || result.videoUrl || result.audioUrl || result.coverUrl || result.images.length || result.cleanImages.length);
+  const hasMedia = Boolean(result.videoUrlHd || result.videoUrl || result.audioUrl || result.coverUrl || result.images.length || result.cleanImages.length || result.livePhotoVideos?.length);
   if (!hasMedia) throw retryableError("解析接口未返回有效媒体地址");
 }
 
@@ -559,6 +551,9 @@ async function downloadAll(task, result) {
   if (videoUrl) {
     // 只要返回了视频地址就下载，避免未知作品类型以 0 个文件“完成”。
     candidates.push({ role: result.type === "live_photo" ? "live_video" : "video", url: videoUrl, index: 0 });
+  }
+  if (Array.isArray(result.livePhotoVideos)) {
+    result.livePhotoVideos.forEach((url, index) => candidates.push({ role: "live_video", url, index }));
   }
   if (result.audioUrl) candidates.push({ role: "audio", url: result.audioUrl, index: 0 });
   if (result.coverUrl && !imageUrls.length) candidates.push({ role: "cover", url: result.coverUrl, index: 0 });
@@ -631,7 +626,9 @@ function mediaFilename(naming, item, extension) {
   const base = naming?.base || authorFileBase("未知作者", 1);
   // The author sequence identifies the work. Extra photos need unique paths,
   // but their label must not look like a new work sequence.
-  const itemSuffix = item.role === "image" && item.index > 0 ? `-照片${item.index + 1}` : "";
+  const itemSuffix = item.role === "image" && item.index > 0
+    ? `-照片${item.index + 1}`
+    : item.role === "live_video" && item.index > 0 ? `-实况${item.index + 1}` : "";
   return `${base}${itemSuffix}.${extension}`;
 }
 

@@ -66,7 +66,9 @@ export async function writeArchive({ root, task, rawApi, record }) {
 
 function archiveMediaFilename(author, sequence, file, extension) {
   const base = sequence > 1 ? `${author}.${sequence}` : author;
-  const suffix = file.role === "image" && file.index > 0 ? `-照片${file.index + 1}` : "";
+  const suffix = file.role === "image" && file.index > 0
+    ? `-照片${file.index + 1}`
+    : file.role === "live_video" && file.index > 0 ? `-实况${file.index + 1}` : "";
   return `${base}${suffix}.${extension}`;
 }
 
