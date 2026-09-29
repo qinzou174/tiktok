@@ -5,6 +5,9 @@ for (const message of [
   "The platform flagged the request as automated traffic; the identity has been cooled down.",
   "No identity is available; the pool is expected to recover in 10 seconds.",
   "Failed to connecting to 8.134.172.132 port 5558, Connection timed out",
+  "积分余额不足",
+  "Insufficient credits",
+  "Quota exhausted",
 ]) {
   assert.equal(isParserInfrastructureFailure(message), true, message);
 }
